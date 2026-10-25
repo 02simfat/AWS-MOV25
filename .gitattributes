@@ -1,0 +1,3 @@
+# Bash-skript ska alltid ha Linux-radslut (LF).
+# Med Windows-radslut (CRLF) kraschar de när servern kör dem.
+*.sh text eol=lf
