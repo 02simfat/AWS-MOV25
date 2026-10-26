@@ -11,8 +11,8 @@ Varje veckomapp har en egen README som dokumenterar veckans arbete, med syfte, s
 
 ## Innehåll
 
-- [ ] [V42](V42/) - Compute och kom igång: Novatrix webbsida på EC2
-- [ ] [V43](V43/) - IAM och identitet
+- [x] [V42](V42/) - Compute och kom igång: Novatrix webbsida på EC2
+- [x] [V43](V43/) - IAM och identitet
 - [ ] [V44](V44/) - Nätverk och säkerhet
 - [ ] [V45](V45/) - Storage och databas
 - [ ] [V46](V46/) - IaC med CloudFormation

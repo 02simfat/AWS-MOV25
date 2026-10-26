@@ -15,6 +15,8 @@ Novatrix har nu tre sorters identiteter i AWS:
 - **En adminanvändare:** `Simon-admin` med MFA. Root används inte längre till vardags.
 - **En roll för en tjänst:** `Novatrix-ec2-S3-Read` låter webbservern `Novatrix-web` **läsa** från bucketen `novatrix-bucket-01`, utan nycklar på servern.
 
+**VG:** En publiceringskedja byggd från kod. Utveckling lämnar ett utkast, drift lånar en roll och publicerar, och servern visar sidan. Ingen kan publicera ensam, och allt byggs och rivs med två skript.
+
 ## Innehåll
 
 1. Syfte
@@ -25,9 +27,10 @@ Novatrix har nu tre sorters identiteter i AWS:
 6. Delmoment 3: Policies enligt least privilege
 7. Delmoment 4: Behörigheter mellan tjänster
 8. Delmoment 5: Verifiering
-9. Säkerhet
-10. Förbättringar (inför VG)
+9. VG: Publiceringskedjan
+10. Säkerhet
 11. Städning
+12. Bilaga: policyerna (VG)
 
 ---
 
@@ -315,27 +318,353 @@ Alla fyra tester blev som förväntat. Behörigheterna fungerar som jag planerad
 
 ---
 
+## VG: Publiceringskedjan
+
+### Problemet i G-delen
+
+Två av de färdiga policyerna är för breda:
+
+- **drift** har `AmazonS3FullAccess`: `s3:*` på **alla** buckets. Drift kan radera alla buckets i kontot.
+- **Utveckling** och **servern** har `AmazonS3ReadOnlyAccess`: läsrätt i **alla** buckets, inte bara Novatrix.
+
+I VG skriver jag egna policies i JSON som pekar ut exakt vad som gäller. Jag bygger också en kedja där användarna och servern hänger ihop.
+
+### Iden
+
+Novatrix ska kunna uppdatera sin webbsida säkert. Ingen ska kunna ändra sajten ensam.
+
+```
+dev-lisa (Utveckling)
+   |  laddar upp ett utkast
+   v
+S3: utkast/index.html
+   |
+ops-omar (drift) lånar rollen novatrix-publicera
+   |  kopierar utkastet
+   v
+S3: publicerat/index.html
+   |
+Novatrix-web-vg (EC2) med rollen novatrix-ec2-webb
+   |  hämtar sidan, får bara läsa publicerat/
+   v
+Besökare ser den nya sidan
+```
+
+### Vem får vad
+
+| Identitet | Får | Får inte |
+|---|---|---|
+| Grupp `novatrix-utveckling` (`dev-lisa`) | Läsa bucketen, ladda upp i `utkast/` | Publicera, radera, låna roller |
+| Grupp `novatrix-drift` (`ops-omar`) | Starta, stoppa och starta om Novatrix-servrar. Låna `novatrix-publicera`. | Radera servrar, skriva i S3 själv |
+| Roll `novatrix-publicera` | Läsa `utkast/`, skriva i `publicerat/` | Radera, ändra utkast |
+| Roll `novatrix-ec2-webb` | Läsa `publicerat/` | Läsa utkast, skriva, låna roller |
+
+Varför det är least privilege:
+
+- **Varje policy pekar på exakt en bucket och en mapp**, inte `"Resource": "*"`.
+- **Ingen kan radera** något. Det finns ingen `Delete` i någon policy.
+- **Drift publicerar bara via rollen.** Drift själv kan inte skriva i S3, så varje publicering syns som en egen rollsession.
+- **Drift får bara styra servrar med taggen `Project=Novatrix`** och kan inte radera dem. Nu sköter drift servrarna, vilket är drifts riktiga jobb.
+- **Servern kan inte klättra i kedjan.** Den får inte låna publicera-rollen.
+
+Trust policyn för `novatrix-publicera` pekar på `arn:aws:iam::KONTO_ID:root`. Här betyder `root` **kontot**, inte root-användaren. Den säger: "identiteter i kontot får låna rollen, **om deras egen policy tillåter det**". Bara gruppen drift har en sådan policy. Därför räcker det att lägga en ny driftperson i gruppen.
+
+### Filerna i V43
+
+| Fil | Vad den gör |
+|---|---|
+| `installningar.ps1` | Alla värden på ett ställe: region, bucket, key pair, security group och team |
+| `deploy.ps1` | Bygger allt: bucket, grupper, användare, två roller och en server |
+| `destroy.ps1` | River allt i omvänd ordning. Det som redan är borta hoppas över. |
+| `test.ps1` | Testar 16 behörigheter med IAM Policy Simulator |
+| `publicera.ps1` | Drifts verktyg: lånar rollen och publicerar utkastet |
+| `user-data-s3.sh` | Servern installerar httpd och hämtar sidan från S3 |
+| `index.html`, `index-v2.html` | Sidan i version 1 och version 2 |
+| `policies/` | Sex JSON-policies, se *Bilaga: policyerna (VG)* |
+
+**Inget kontonummer i repot.** I JSON-filerna står `KONTO_ID`, `BUCKETNAMN` och `REGION`. `deploy.ps1` fyller i de riktiga värdena i tillfälliga filer när skriptet körs.
+
+`dev-lisa` och `ops-omar` har **inga lösenord eller nycklar**. De finns bara för att testa gruppernas regler. En användare som ingen kan logga in som kan inte missbrukas.
+
+### Så bygger deploy.ps1 kedjan
+
+Samma steg som i konsolen, fast som kommandon:
+
+```powershell
+# Människorna: policy -> grupp -> användare
+aws iam create-policy --policy-name novatrix-drift --policy-document file://drift.json
+aws iam create-group --group-name novatrix-drift
+aws iam attach-group-policy --group-name novatrix-drift --policy-arn <policy-arn>
+aws iam create-user --user-name ops-omar
+aws iam add-user-to-group --user-name ops-omar --group-name novatrix-drift
+
+# En roll: trust policy (vem) + behörighetspolicy (vad)
+aws iam create-role --role-name novatrix-publicera --assume-role-policy-document file://trust-publicera.json
+aws iam put-role-policy --role-name novatrix-publicera --policy-name publicera --policy-document file://publicera.json
+
+# Serverns roll läggs i en instance profile, som servern startas med
+aws iam create-instance-profile --instance-profile-name novatrix-ec2-webb
+aws iam add-role-to-instance-profile --instance-profile-name novatrix-ec2-webb --role-name novatrix-ec2-webb
+aws ec2 run-instances ... --iam-instance-profile Name=novatrix-ec2-webb --user-data file://user-data-s3.sh
+```
+
+Hela skripten ligger i mappen `V43`.
+
+### Verifiering
+
+**1. Bygget.** `deploy.ps1` byggde allt och skrev ut serverns IP-adress.
+
+![deploy.ps1 bygger kedjan](Bilder-v43/14-vg-deploy.png)
+
+Servern hämtade **Version 1** från `publicerat/` med sin roll:
+
+![Version 1 hämtad från S3](Bilder-v43/15-vg-sidan-v1.png)
+
+**2. Alla behörigheter.** `test.ps1` frågar Policy Simulator om 16 saker. Simulatorn svarar vad AWS skulle säga, utan att något händer på riktigt. Alla 16 blev som jag väntade mig.
+
+![test.ps1: 16 av 16 OK](Bilder-v43/16-vg-test.png)
+
+**3. Kedjan på riktigt.** Lisa har inga nycklar, så jag laddade upp utkastet som admin. Sedan körde jag drifts verktyg:
+
+```powershell
+aws s3 cp .\index-v2.html s3://novatrix-sajt-02simfat-01/utkast/index.html
+.\publicera.ps1
+```
+
+Raden `Nu är jag: ...assumed-role/novatrix-publicera` visar att skriptet lånade rollen innan det publicerade.
+
+![publicera.ps1 lånar rollen och publicerar](Bilder-v43/17-vg-publicera.png)
+
+På servern testade jag vad rollen `novatrix-ec2-webb` får göra:
+
+```bash
+aws sts get-caller-identity --query Arn --output text
+sudo aws s3 cp s3://novatrix-sajt-02simfat-01/publicerat/index.html /var/www/html/index.html
+aws s3 cp s3://novatrix-sajt-02simfat-01/utkast/index.html -
+aws sts assume-role --role-arn arn:aws:iam::661561392776:role/novatrix-publicera --role-session-name test
+```
+
+| Test | Resultat |
+|---|---|
+| Vem är servern? | `assumed-role/novatrix-ec2-webb` ✅ |
+| Hämta den publicerade sidan | Lyckades ✅ |
+| Läsa utkastet | `(403) Forbidden` ✅ nekad |
+| Låna publicera-rollen | `AccessDenied` ✅ nekad |
+
+`403 Forbidden` kommer från `HeadObject` ("finns filen?"). Ett sådant svar har ingen feltext, så AWS skickar bara koden 403, alltså "du får inte".
+
+![Servertesterna](Bilder-v43/18-vg-servertester.png)
+
+Efter publiceringen visar servern **Version 2**:
+
+![Version 2 på servern](Bilder-v43/19-vg-sidan-v2.png)
+
+**4. Riv och bygg igen.** Jag rev allt med `destroy.ps1`. Bara de två lösenorden fanns inte, eftersom användarna aldrig har haft några.
+
+![destroy.ps1 river allt](Bilder-v43/20-vg-destroy.png)
+
+Sedan byggde jag allt igen med `deploy.ps1` och körde `test.ps1`. Det blev 16 av 16 OK igen. **Miljön går att återskapa från repot.**
+
+![deploy.ps1 en gång till](Bilder-v43/21-vg-deploy-igen.png)
+
+![test.ps1 efter ny deploy](Bilder-v43/22-vg-test-igen.png)
+
+### Problem och lösning
+
+Vid `6/6` kom felet:
+
+```
+An error occurred (InvalidParameterValue) when calling the RunInstances operation: Value (novatrix-ec2-webb) for parameter iamInstanceProfile.name is invalid. Invalid IAM Instance Profile name
+```
+
+**Varför:** IAM är global. En ny instance profile tar några sekunder innan EC2 hittar den.
+
+**Lösning:** `deploy.ps1` försöker igen var 10:e sekund, upp till sex gånger. Det andra försöket lyckades båda gångerna.
+
+### Så återskapar du miljön
+
+1. Klona repot och gå till mappen:
+   ```powershell
+   git clone https://github.com/02simfat/AWS-MOV25.git
+   cd AWS-MOV25\V43
+   ```
+2. Logga in som en IAM-användare med adminrätt (inte root):
+   ```powershell
+   aws configure set region eu-north-1
+   aws login
+   ```
+3. Byt värdena i `installningar.ps1` om du har ett annat konto: `$Bucket` (måste vara unikt i hela AWS), `$KeyName` och `$SecurityGroup`.
+4. Bygg och testa:
+   ```powershell
+   .\deploy.ps1
+   .\test.ps1
+   ```
+5. Riv allt när du är klar:
+   ```powershell
+   .\destroy.ps1
+   ```
+
+Kör `destroy.ps1` först om något redan finns kvar. `deploy.ps1` stannar annars på det första som redan finns.
+
+---
+
 ## Säkerhet
 
-- **Root** används inte längre. Jag loggar in som `Simon-admin`. Både root och admin har MFA.
+- **Root** används inte längre. Jag loggar in som `Simon-admin`, även i AWS CLI. Både root och admin har MFA.
 - **Behörighet via grupp**, aldrig direkt på en person.
 - **Inga nycklar på servern.** Rollen ger tillfälliga nycklar.
-- **Bucketen är privat.** *Block all public access* är på.
-- **Inga lösenord, inloggnings-URL:er eller CSV-filer från IAM** ligger i repot.
-
-## Förbättringar (inför VG)
-
-Två policies är bredare än de behöver vara:
-
-| Vad | Problem | Förbättring |
-|---|---|---|
-| drift: `AmazonS3FullAccess` | `s3:*` på alla buckets. Drift kan radera alla buckets i kontot. | Egen policy: bara `novatrix-bucket-01`, ingen radering av buckets. |
-| Utveckling och rollen: `AmazonS3ReadOnlyAccess` | `"Resource": "*"` ger läsrätt i **alla** buckets, inte bara Novatrix. | Egen policy som bara gäller `novatrix-bucket-01`. |
-
-Det gör jag i VG-delen, med egna JSON-policies som skapas från kod.
+- **Bucketarna är privata.** *Block all public access* är på.
+- **Inga lösenord, inloggnings-URL:er, CSV-filer eller kontonummer i JSON-filerna** ligger i repot.
 
 ## Städning
 
 - Jag **stoppar** `Novatrix-web` när jag är klar för dagen.
-- Jag **behåller** rollen `Novatrix-ec2-S3-Read` och bucketen `novatrix-bucket-01`. Vi bygger vidare på dem kommande veckor.
-- IAM kostar inget, men jag tar bort testanvändare som inte behövs längre.
+- Jag **behåller** rollen `Novatrix-ec2-S3-Read` och bucketen `novatrix-bucket-01` från G-delen.
+- VG-miljön river jag med `destroy.ps1` när jag är klar. Den kan byggas igen när som helst med `deploy.ps1`.
+
+---
+
+## Bilaga: policyerna (VG)
+
+`KONTO_ID`, `BUCKETNAMN` och `REGION` fylls i av `deploy.ps1`.
+
+**utveckling.json** sitter på gruppen `novatrix-utveckling`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListaBucketen",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::BUCKETNAMN"
+    },
+    {
+      "Sid": "LasaAllaFiler",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::BUCKETNAMN/*"
+    },
+    {
+      "Sid": "LaddaUppUtkast",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::BUCKETNAMN/utkast/*"
+    }
+  ]
+}
+```
+
+**drift.json** sitter på gruppen `novatrix-drift`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SeServrar",
+      "Effect": "Allow",
+      "Action": "ec2:Describe*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "StyraNovatrixServrar",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:StartInstances",
+        "ec2:StopInstances",
+        "ec2:RebootInstances"
+      ],
+      "Resource": "arn:aws:ec2:REGION:KONTO_ID:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/Project": "Novatrix"
+        }
+      }
+    },
+    {
+      "Sid": "LanaPubliceraRollen",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": "arn:aws:iam::KONTO_ID:role/novatrix-publicera"
+    }
+  ]
+}
+```
+
+`ec2:Describe*` på `*` är den enda stjärnan. AWS kan inte begränsa "se servrar" till en viss server, och det är bara läsning.
+
+**trust-publicera.json** säger vem som får låna `novatrix-publicera`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "IdentiteterIKontot",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::KONTO_ID:root"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+```
+
+**publicera.json** säger vad `novatrix-publicera` får göra:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "LasaUtkast",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::BUCKETNAMN/utkast/*"
+    },
+    {
+      "Sid": "SkrivaPublicerat",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::BUCKETNAMN/publicerat/*"
+    }
+  ]
+}
+```
+
+**trust-ec2.json** säger att bara EC2 får låna `novatrix-ec2-webb`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BaraEC2",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "ec2.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+```
+
+**ec2-webb.json** säger vad `novatrix-ec2-webb` får göra:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "LasaPubliceradeSidor",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::BUCKETNAMN/publicerat/*"
+    }
+  ]
+}
+```

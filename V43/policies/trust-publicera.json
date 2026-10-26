@@ -1,0 +1,13 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "IdentiteterIKontot",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::KONTO_ID:root"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
