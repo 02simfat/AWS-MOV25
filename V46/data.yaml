@@ -57,6 +57,9 @@ Resources:
       # Free plan allows at most 1 day
       BackupRetentionPeriod: 1
       DeleteAutomatedBackups: true
+      Tags:
+        - Key: Course
+          Value: MOV25
 
   # Shared file system for wp-content, encrypted at rest
   FileSystem:
