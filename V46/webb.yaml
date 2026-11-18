@@ -4,7 +4,6 @@ Description: >
   web server, and the web server novatrix-web in the public subnet. User data installs
   WordPress and mounts EFS on wp-content. The WordPress installer is run in the browser.
   Needs the network and data stacks. Stack name: novatrix-webb.
-  Skeleton: the role and the user data are done, the instance is yours, see Del 13.
 
 Parameters:
   Prefix:
@@ -60,12 +59,20 @@ Resources:
       InstanceProfileName: !Sub ${Prefix}-ec2-s3-read
       Roles: [!Ref WebRole]
 
-  # TODO WebServer (AWS::EC2::Instance): ImageId !Ref LatestAmiId, InstanceType, KeyName,
-  #   SubnetId (public subnet from the network stack), SecurityGroupIds (web group),
-  #   IamInstanceProfile !Ref WebInstanceProfile, tag Name ${Prefix}-web.
+  # The web server in the public subnet, with the web group and the role above
   WebServer:
     Type: AWS::EC2::Instance
     Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !ImportValue {"Fn::Sub": "${Prefix}-public-subnet-id"}
+      SecurityGroupIds:
+        - !ImportValue {"Fn::Sub": "${Prefix}-web-sg-id"}
+      IamInstanceProfile: !Ref WebInstanceProfile
+      Tags:
+        - Key: Name
+          Value: !Sub ${Prefix}-web
       UserData:
         Fn::Base64: !Sub
           - |
