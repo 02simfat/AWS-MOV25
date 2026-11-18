@@ -17,8 +17,8 @@ Resources:
         - Key: Name
           Value: !Sub ${Prefix}-vpc
         # Step 2 of the demo: add this tag, then look at the change set
-        # - Key: Course
-        #   Value: MOV25
+        - Key: Course
+          Value: MOV25
 
 Outputs:
   VpcId:
